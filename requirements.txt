@@ -1,7 +1,8 @@
 onnx
 onnxruntime
-onnxruntime-gpu
 opencv-python
 numpy
 scikit-image
 faiss-cpu
+rknn-toolkit2
+opencv_contrib_python
