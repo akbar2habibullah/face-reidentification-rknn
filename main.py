@@ -12,10 +12,8 @@ from models import SCRFD, ArcFace
 from utils.logging import setup_logging
 from utils.helpers import compute_similarity, draw_bbox_info, draw_bbox
 
-
 warnings.filterwarnings("ignore")
 setup_logging(log_to_file=True)
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Face Detection-and-Recognition with FAISS")
@@ -25,7 +23,8 @@ def parse_args():
     parser.add_argument("--similarity-thresh", type=float, default=0.4, help="Similarity threshold between faces")
     parser.add_argument("--confidence-thresh", type=float, default=0.5, help="Confidence threshold for face detection")
     parser.add_argument("--faces-dir", type=str, default="./assets/faces", help="Path to faces stored dir")
-    parser.add_argument("--source", type=str, default="./assets/in_video.mp4", help="Video file or webcam source")
+    # Changed default source to '0' for webcam ease of use, though command line override is preferred
+    parser.add_argument("--source", type=str, default="0", help="Video file or webcam index (e.g. 0)")
     parser.add_argument("--max-num", type=int, default=0, help="Maximum number of face detections from a frame")
     parser.add_argument(
         "--db-path",
@@ -35,9 +34,9 @@ def parse_args():
     )
     parser.add_argument("--update-db", action="store_true", help="Force update of the face database")
     parser.add_argument("--output", type=str, default="output_video.mp4", help="Output path for annotated video")
+    parser.add_argument("--no-display", action="store_true", help="Disable video display window (useful for headless)")
 
     return parser.parse_args()
-
 
 def build_face_database(detector: SCRFD, recognizer: ArcFace, params: argparse.Namespace, force_update: bool = False) -> FaceDatabase:
     face_db = FaceDatabase(db_path=params.db_path, max_workers=4)
@@ -82,7 +81,6 @@ def build_face_database(detector: SCRFD, recognizer: ArcFace, params: argparse.N
     face_db.save()
     return face_db
 
-
 def frame_processor(frame: np.ndarray, detector: SCRFD, recognizer: ArcFace, face_db: FaceDatabase, colors: dict, params: argparse.Namespace) -> np.ndarray:
     try:
         bboxes, kpss = detector.detect(frame, params.max_num)
@@ -108,28 +106,46 @@ def frame_processor(frame: np.ndarray, detector: SCRFD, recognizer: ArcFace, fac
         if not embeddings:
             return frame
 
-        # Batch search for all faces - this now maintains proper ordering
+        # Batch search for all faces
         results = face_db.batch_search(embeddings, params.similarity_thresh)
 
-        # Draw results - results are now guaranteed to match the embedding order
+        # Draw results
         for bbox, (name, similarity) in zip(processed_bboxes, results):
             if name != "Unknown":
                 if name not in colors:
                     colors[name] = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
                 draw_bbox_info(frame, bbox, similarity=similarity, name=name, color=colors[name])
             else:
-                draw_bbox(frame, bbox, (255, 0, 0))
+                draw_bbox(frame, bbox, (0, 0, 255)) # Red for unknown
 
     except Exception as e:
         logging.error(f"Error in frame processing: {e}")
 
     return frame
 
+def draw_performance_stats(frame, fps, inference_time_ms):
+    """Draw FPS and Inference time on the frame"""
+    # Create a semi-transparent background for text
+    h, w, _ = frame.shape
+    
+    stats_text = [
+        f"FPS: {fps:.1f}",
+        f"Latency: {inference_time_ms:.1f}ms"
+    ]
+    
+    for i, text in enumerate(stats_text):
+        y_pos = 30 + (i * 30)
+        # Draw shadow/outline for better visibility
+        cv2.putText(frame, text, (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4)
+        # Draw text
+        cv2.putText(frame, text, (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
 def main(params):
     try:
+        logging.info("Loading models...")
         detector = SCRFD(params.det_weight, input_size=(640, 640), conf_thres=params.confidence_thresh)
         recognizer = ArcFace(params.rec_weight)
+        logging.info("Models loaded successfully.")
     except Exception as e:
         logging.error(f"Failed to load model weights: {e}")
         return
@@ -139,51 +155,92 @@ def main(params):
         colors = {}
 
         try:
-            cap = cv2.VideoCapture(params.source if not isinstance(params.source, int) else int(params.source))
-            if not cap.isOpened():
-                raise IOError(f"Could not open video source: {params.source}")
+            # Source handling: if it looks like a number, convert to int for webcam
+            source = params.source
+            if isinstance(source, str) and source.isdigit():
+                source = int(source)
+                logging.info(f"Opening Webcam Index: {source}")
+            else:
+                logging.info(f"Opening Video File: {source}")
 
+            cap = cv2.VideoCapture(source)
+            if not cap.isOpened():
+                raise IOError(f"Could not open video source: {source}")
+
+            # Setup video writer
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            out = cv2.VideoWriter(params.output, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+            fps_input = cap.get(cv2.CAP_PROP_FPS)
+            # Default to 30 if camera doesn't report FPS
+            if fps_input == 0: fps_input = 30.0 
+            
+            out = cv2.VideoWriter(params.output, cv2.VideoWriter_fourcc(*"mp4v"), fps_input, (width, height))
 
             frame_count = 0
+            
+            # FPS Calculation variables
+            prev_frame_time = 0
+            new_frame_time = 0
+            fps_avg = 0.0
+            alpha = 0.1  # Smoothing factor for FPS (0.1 means slow smoothing, 0.9 means fast reaction)
+
+            logging.info("Starting processing loop...")
+            
             while True:
                 ret, frame = cap.read()
                 if not ret:
-                    break
+                    if isinstance(source, int): 
+                        logging.error("Failed to grab frame from camera.")
+                        continue # Keep trying for webcam
+                    else:
+                        break # End of video file
 
-                start = time.time()
+                # Performance timing
+                start_process = time.time()
+                
+                # Core Processing
                 frame = frame_processor(frame, detector, recognizer, face_db, colors, params)
-                end = time.time()
+                
+                end_process = time.time()
+                inference_time = (end_process - start_process) * 1000 # in ms
 
+                # FPS Calculation
+                new_frame_time = time.time()
+                # Protect against division by zero on very first frame or super fast processing
+                time_diff = new_frame_time - prev_frame_time
+                if time_diff > 0:
+                    curr_fps = 1.0 / time_diff
+                    # Exponential Moving Average for smoother FPS display
+                    fps_avg = (1 - alpha) * fps_avg + alpha * curr_fps
+                prev_frame_time = new_frame_time
+
+                # Draw Stats
+                draw_performance_stats(frame, fps_avg, inference_time)
+
+                # Write to output file
                 out.write(frame)
 
-                cv2.imshow("Face Recognition", frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
+                # Display
+                if not params.no_display:
+                    cv2.imshow("Face Recognition", frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
 
                 frame_count += 1
-                logging.debug(f"Frame {frame_count}, FPS: {1 / (end - start):.2f}")
+                if frame_count % 30 == 0:
+                    logging.info(f"Frame {frame_count} | FPS: {fps_avg:.2f} | Latency: {inference_time:.2f}ms")
 
             logging.info(f"Processed {frame_count} frames.")
 
         except Exception as e:
             logging.error(f"Error during video processing: {e}")
         finally:
-            # Proper resource cleanup in finally block
             if 'cap' in locals():
                 cap.release()
             if 'out' in locals():
                 out.release()
             cv2.destroyAllWindows()
 
-
 if __name__ == "__main__":
     args = parse_args()
-    try:
-        args.source = int(args.source)
-    except ValueError:
-        pass
     main(args)
